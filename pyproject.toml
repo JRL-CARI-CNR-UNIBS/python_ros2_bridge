@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python_ros2_bridge"
+version = "0.1.0"
+description = "ROS2/ROS-agnostic command bridge for joint control and human-obstacle perception"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "JRL-CARI-CNR-UNIBS" },
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "pin",
+]
+
+[tool.setuptools.packages.find]
+include = ["python_ros2_bridge*"]

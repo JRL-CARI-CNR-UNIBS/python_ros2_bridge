@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import threading
+from typing import Iterable, List, Optional, Dict, Tuple
+import numpy as np
+import time
+from functools import partial
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data
+
+from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import JointState
+from geometry_msgs.msg import PoseArray
+from tf2_ros import Buffer, TransformListener
+
+from controller_manager_msgs.srv import SwitchController
+from builtin_interfaces.msg import Duration as MsgDuration
+
+try:
+    from zed_skeleton_kinematics_msgs.msg import ObjectsKinematicsStamped
+except ImportError:
+    ObjectsKinematicsStamped = None
+
+# NEW: import the abstract, ROS-agnostic base
+from python_ros2_bridge.base_command_bridge_abc import BaseCommandBridgeABC
+
+
+class JointStateCommandBridge(Node, BaseCommandBridgeABC):
+    """Bridge node: ROS2 JointState subscriber → command publisher + obstacles/kinematics."""
+
+    def __init__(
+        self,
+        ordered_joint_names: Iterable[str],
+        *,
+        threshold: float = 0.05,
+        node_name: str = "joint_state_command_bridge",
+        joint_states_topic: str = "/joint_states",
+        command_topic: str = "/forward_position_controller/commands",
+        effort_command_topic: str = "/forward_effort_controller/commands",
+        obstacles_topics: Iterable[str] = ("/rs1/poses", "/rs2/poses"),
+        kinematics_topics: Iterable[str] = (),
+        switch_service_name: str = "/controller_manager/switch_controller",
+        position_controller_name: str = "forward_position_controller",
+        trajectory_controller_name: str = "scaled_joint_trajectory_controller",
+        effort_controller_name: str = "forward_effort_controller",
+        timeout_sec: float = 5.0,
+        start_executor: bool = True,
+    ) -> None:
+        # Ensure rclpy is initialized
+        try:
+            rclpy.get_default_context()
+            if not rclpy.ok():
+                rclpy.init()
+        except Exception:
+            try:
+                rclpy.init()
+            except Exception:
+                pass
+
+        Node.__init__(self, node_name)
+        BaseCommandBridgeABC.__init__(self, ordered_joint_names, threshold=threshold)
+
+        self.joint_states_topic = str(joint_states_topic)
+        self.command_topic = str(command_topic)
+        self.effort_command_topic = str(effort_command_topic)
+        self.obstacles_topics = list(obstacles_topics)
+        self.kinematics_topics = list(kinematics_topics)
+
+        self._js_sub = self.create_subscription(
+            JointState,
+            self.joint_states_topic,
+            self._on_joint_state_ros,
+            qos_profile_sensor_data,
+        )
+
+        self._cmd_pub = self.create_publisher(Float64MultiArray, self.command_topic, 10)
+        self._effort_cmd_pub = self.create_publisher(Float64MultiArray, self.effort_command_topic, 10)
+
+        # Service client for controller manager
+        self._switch_service_name = str(switch_service_name)
+        self._switch_client = self.create_client(SwitchController, self._switch_service_name)
+        self._pos_ctrl = str(position_controller_name)
+        self._traj_ctrl = str(trajectory_controller_name)
+        self._effort_ctrl = str(effort_controller_name)
+        self._svc_timeout_sec = float(timeout_sec)
+
+        # TF + caches
+        self._tf_buffer: Buffer = Buffer()
+        self._tf_listener: TransformListener = TransformListener(self._tf_buffer, self)
+        self._frame_to_world_cache: Dict[str, np.ndarray] = {}
+        self._last_tf_warn_time: Dict[str, float] = {}
+
+        # Legacy PoseArray store (kept for compatibility)
+        self.obstacles_: Dict[str, List[np.ndarray]] = {}
+        self._obstacles_last_recv_: Dict[str, rclpy.time.Time] = {}
+        self._poses_lock = threading.Lock()
+
+        # Kinematics store: topic -> (pos[N,3], vel[N,3], acc[N,3])
+        self.kinematics_: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._kin_last_recv_: Dict[str, rclpy.time.Time] = {}
+
+        # Subscriptions for PoseArray
+        self._poses_subs = []
+        for topic in obstacles_topics:
+            topic = str(topic)
+            cb = partial(self._on_pose_array, topic_name=topic)
+            sub = self.create_subscription(PoseArray, topic, cb, qos_profile_sensor_data)
+            self._poses_subs.append(sub)
+            self.obstacles_[topic] = []
+            try:
+                self._obstacles_last_recv_[topic] = rclpy.time.Time(seconds=0, nanoseconds=0)
+            except Exception:
+                self._obstacles_last_recv_[topic] = rclpy.time.Time()
+
+        # Subscriptions for kinematics
+        self._kin_subs = []
+        for topic in kinematics_topics:
+            topic = str(topic)
+            if ObjectsKinematicsStamped is not None:
+                cb = partial(self._on_objects_kinematics, topic_name=topic)
+                sub = self.create_subscription(ObjectsKinematicsStamped, topic, cb, qos_profile_sensor_data)
+                self._kin_subs.append(sub)
+            self.kinematics_[topic] = (np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3)))
+            try:
+                self._kin_last_recv_[topic] = rclpy.time.Time(seconds=0, nanoseconds=0)
+            except Exception:
+                self._kin_last_recv_[topic] = rclpy.time.Time()
+
+        # Preallocated kinematics buffers per topic TO BE TESTED
+        self._kin_buffers: Dict[str, Dict[str, np.ndarray]] = {}
+
+        for topic in kinematics_topics:
+            topic = str(topic)
+            self._kin_buffers[topic] = {
+                "pos": np.empty((0, 3), dtype=float),
+                "vel": np.empty((0, 3), dtype=float),
+                "acc": np.empty((0, 3), dtype=float),
+            }
+
+        # Optional executor
+        self._executor: Optional[SingleThreadedExecutor] = None
+        self._spin_thread: Optional[threading.Thread] = None
+        if start_executor:
+            self._executor = SingleThreadedExecutor()
+            self._executor.add_node(self)
+            self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
+            self._spin_thread.start()
+
+        self.get_logger().info(
+            f"Initialized with joints: {self.ordered_joint_names_}; "
+            f"threshold={self.threshold}; "
+            f"obstacles_topics={list(obstacles_topics)}; "
+            f"kinematics_topics={list(kinematics_topics)}"
+        )
+
+    # ---------------------------- ROS callbacks ----------------------------
+    def _on_joint_state_ros(self, msg: JointState) -> None:
+        # Delegate to transport-agnostic mapper
+        self.map_joint_state(msg.name, msg.position, msg.velocity, msg.effort)
+
+    def _on_pose_array(self, msg: PoseArray, *, topic_name: str) -> None:
+        frame_id = (msg.header.frame_id or "").strip() or "world"
+        pts = [
+            np.array([float(p.position.x), float(p.position.y), float(p.position.z)], dtype=float)
+            for p in msg.poses
+        ]
+
+        if frame_id != "world":
+            T = self._get_transform_matrix_to_world(frame_id, msg.header.stamp)
+            if T is None:
+                return
+            pts_world = [(T @ np.array([v[0], v[1], v[2], 1.0], dtype=float))[:3] for v in pts]
+        else:
+            pts_world = pts
+
+        recv_time = self.get_clock().now()
+        with self._poses_lock:
+            self.obstacles_[topic_name] = [np.asarray(v, dtype=float) for v in pts_world]
+            self._obstacles_last_recv_[topic_name] = recv_time
+
+    def _on_objects_kinematics(
+            self,
+            msg: ObjectsKinematicsStamped,
+            *,
+            topic_name: str
+    ) -> None:
+        """Efficient kinematics callback: vectorized, allocation-minimal."""
+
+        frame_id = (msg.header.frame_id or "").strip() or "world"
+        recv_time = self.get_clock().now()
+
+        # -------- collect raw arrays (vectorized) -----------------------------
+        pos_chunks = []
+        vel_chunks = []
+        acc_chunks = []
+
+        for objkin in msg.objects:
+            obj = getattr(objkin, "object", None)
+            sk = getattr(obj, "skeleton_3d", None) if obj is not None else None
+            if sk is None or not hasattr(sk, "keypoints"):
+                continue
+
+            kps = sk.keypoints
+            vels = getattr(objkin, "keypoint_velocities", None)
+            accs = getattr(objkin, "keypoint_accelerations", None)
+            if not kps or not vels or not accs:
+                continue
+
+            n = min(len(kps), len(vels), len(accs))
+            if n == 0:
+                continue
+
+            try:
+                pos = np.asarray([kp.kp for kp in kps[:n]], dtype=float)
+                vel = np.asarray([v.kp for v in vels[:n]], dtype=float)
+                acc = np.asarray([a.kp for a in accs[:n]], dtype=float)
+            except Exception:
+                # Fallback for alternative field layouts
+                pos = np.asarray([[kp.x, kp.y, kp.z] for kp in kps[:n]], dtype=float)
+                vel = np.asarray([[v.x, v.y, v.z] for v in vels[:n]], dtype=float)
+                acc = np.asarray([[a.x, a.y, a.z] for a in accs[:n]], dtype=float)
+
+            # Filter invalid (zero) keypoints in one shot
+            mask = np.linalg.norm(pos, axis=1) > 1e-12
+            if not np.any(mask):
+                continue
+
+            pos_chunks.append(pos[mask])
+            vel_chunks.append(vel[mask])
+            acc_chunks.append(acc[mask])
+
+        # -------- no data case -------------------------------------------------
+        if not pos_chunks:
+            with self._poses_lock:
+                self._kin_last_recv_[topic_name] = recv_time
+            return
+
+        # -------- concatenate once --------------------------------------------
+        pos_all = np.concatenate(pos_chunks, axis=0)
+        vel_all = np.concatenate(vel_chunks, axis=0)
+        acc_all = np.concatenate(acc_chunks, axis=0)
+
+        # -------- transform to world (vectorized) ------------------------------
+        if frame_id != "world":
+            T = self._get_transform_matrix_to_world(frame_id, msg.header.stamp)
+            if T is None:
+                return
+
+            R = T[:3, :3]
+            t = T[:3, 3]
+
+            pos_all = pos_all @ R.T + t
+            vel_all = vel_all @ R.T
+            acc_all = acc_all @ R.T
+
+        # -------- reuse preallocated buffers ----------------------------------
+        buf = self._kin_buffers[topic_name]
+        n = pos_all.shape[0]
+
+        if buf["pos"].shape[0] < n:
+            buf["pos"] = np.empty((n, 3), dtype=float)
+            buf["vel"] = np.empty((n, 3), dtype=float)
+            buf["acc"] = np.empty((n, 3), dtype=float)
+
+        buf["pos"][:n] = pos_all
+        buf["vel"][:n] = vel_all
+        buf["acc"][:n] = acc_all
+
+        # -------- publish atomically ------------------------------------------
+        with self._poses_lock:
+            self.kinematics_[topic_name] = (
+                buf["pos"][:n],
+                buf["vel"][:n],
+                buf["acc"][:n],
+            )
+            self._kin_last_recv_[topic_name] = recv_time
+
+    # ---------------------------- ABC overrides ----------------------------
+    def _do_publish(self, q: np.ndarray) -> None:
+        msg = Float64MultiArray()
+        msg.data = q.tolist()
+        self._cmd_pub.publish(msg)
+
+    def getObstacles(self, elapsed = 0.0,  max_age_sec: float = 0.5) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Aggregate recent kinematics into (pos, vel, acc) as in the original node."""
+        now = self.get_clock().now()
+        pos_all, vel_all, acc_all = [], [], []
+
+        with self._poses_lock:
+            for topic, triple in self.kinematics_.items():
+                last = self._kin_last_recv_.get(topic)
+                if last is None:
+                    continue
+                try:
+                    age_sec = float((now - last).nanoseconds) * 1e-9
+                except Exception:
+                    age_sec = float("inf")
+                if age_sec <= float(max_age_sec):
+                    p, v, a = triple
+                    if p.size:
+                        pos_all.append(p)
+                        vel_all.append(v)
+                        acc_all.append(a)
+
+        if pos_all:
+            return (np.vstack(pos_all), np.vstack(vel_all), np.vstack(acc_all))
+        else:
+            z = np.zeros((0, 3), dtype=float)
+            return (z, z.copy(), z.copy())
+
+    # ---------------------------- Effort command ----------------------------
+    def sendEffortCommand(self, tau: np.ndarray) -> None:
+        """Publish a joint-effort command on `effort_command_topic` (no threshold check)."""
+        tau_arr = np.asarray(tau, dtype=float).reshape(-1)
+        if tau_arr.size != len(self.ordered_joint_names_):
+            raise ValueError(
+                f"tau has length {tau_arr.size}, but expected {len(self.ordered_joint_names_)}"
+            )
+        msg = Float64MultiArray()
+        msg.data = tau_arr.tolist()
+        self._effort_cmd_pub.publish(msg)
+
+    # ---------------------------- TF + utilities (ROS-specific) ----------------------------
+    def _get_transform_matrix_to_world(self, frame_id: str, stamp) -> Optional[np.ndarray]:
+        if frame_id in self._frame_to_world_cache:
+            return self._frame_to_world_cache[frame_id]
+        try:
+            time_obj = rclpy.time.Time(
+                seconds=getattr(stamp, "sec", 0), nanoseconds=getattr(stamp, "nanosec", 0)
+            )
+        except Exception:
+            time_obj = rclpy.time.Time()
+        try:
+            ts = self._tf_buffer.lookup_transform("world", frame_id, time_obj)
+        except Exception as e:
+            last = self._last_tf_warn_time.get(frame_id, 0.0)
+            now = time.monotonic()
+            if now - last > 2.0:
+                self.get_logger().warn(f"TF to world unavailable for '{frame_id}': {e}")
+                self._last_tf_warn_time[frame_id] = now
+            return None
+
+        t = ts.transform.translation
+        q = ts.transform.rotation
+        T = np.eye(4, dtype=float)
+        R = self._quat_to_rot(q.x, q.y, q.z, q.w)
+        T[:3, :3] = R
+        T[:3, 3] = np.array([t.x, t.y, t.z], dtype=float)
+        self._frame_to_world_cache[frame_id] = T
+        return T
+
+    @staticmethod
+    def _quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
+        q = np.array([x, y, z, w], dtype=float)
+        n = float(np.linalg.norm(q))
+        if n == 0.0:
+            return np.eye(3, dtype=float)
+        x, y, z, w = q / n
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz = x * y, x * z, y * z
+        wx, wy, wz = w * x, w * y, w * z
+        return np.array(
+            [
+                [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+                [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+                [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+            ],
+            dtype=float,
+        )
+
+    def shutdown(self) -> None:
+        if self._executor is not None:
+            try:
+                self._executor.shutdown()
+            except Exception:
+                pass
+            try:
+                self._executor.remove_node(self)
+            except Exception:
+                pass
+            self._executor = None
+        self.destroy_node()
+
+    # ---------------------------- Controller switching ----------------------------
+    def _switch_controllers(
+        self,
+        *,
+        start_controllers: List[str],
+        stop_controllers: List[str],
+        timeout_sec: float = 10.0,
+    ) -> None:
+        """Shared implementation for the `switch_to_*` helpers below."""
+        if not self._switch_client.wait_for_service(timeout_sec=timeout_sec):
+            raise RuntimeError(f"{self._switch_service_name} service not available")
+
+        req = SwitchController.Request()
+        req.activate_controllers = []
+        req.deactivate_controllers = []
+        req.start_controllers = list(start_controllers)
+        req.stop_controllers = list(stop_controllers)
+
+        if hasattr(req, "strictness"):
+            req.strictness = 0
+        if hasattr(req, "start_asap"):
+            req.start_asap = False
+        if hasattr(req, "activate_asap"):
+            req.activate_asap = False
+        if hasattr(req, "timeout"):
+            req.timeout = MsgDuration(sec=0, nanosec=0)
+
+        future = self._switch_client.call_async(req)
+        if self._executor is None:
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+        else:
+            deadline = time.monotonic() + timeout_sec if timeout_sec is not None else None
+            while not future.done() and (deadline is None or time.monotonic() < deadline):
+                time.sleep(0.01)
+
+        if not future.done():
+            raise TimeoutError("switch_controller call timed out")
+
+        resp = future.result()
+        ok = getattr(resp, "ok", True)
+        if not ok:
+            raise RuntimeError("switch_controller returned ok=False")
+
+    def switch_to_forward_position_controller_service(self, timeout_sec: float = 10.0) -> None:
+        """Stop the trajectory controller and start the forward position controller."""
+        self._switch_controllers(
+            start_controllers=[self._pos_ctrl],
+            stop_controllers=[self._traj_ctrl],
+            timeout_sec=timeout_sec,
+        )
+        self.get_logger().info("Controller switch to forward position controller completed successfully.")
+
+    def switch_to_forward_effort_controller_service(self, timeout_sec: float = 10.0) -> None:
+        """Stop the position/trajectory controllers and start the forward effort controller."""
+        self._switch_controllers(
+            start_controllers=[self._effort_ctrl],
+            stop_controllers=[self._pos_ctrl, self._traj_ctrl],
+            timeout_sec=timeout_sec,
+        )
+        self.get_logger().info("Controller switch to forward effort controller completed successfully.")
