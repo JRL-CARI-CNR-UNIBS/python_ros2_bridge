@@ -14,7 +14,7 @@ ROS2/ROS-agnostic command bridge for joint control and human-obstacle perception
 │   └── human_pose_reader.py         # CSV human skeleton coordinate reader
 └── tests/
     ├── joint_command_test.py        # Sine-wave wrist example / smoke test (--fake for no ROS)
-    └── effort_control_test.py       # Zero-effort control with a TCP safety box (live ROS2)
+    └── effort_control_test.py       # Zero-effort control with a TCP safety box (--fake for no ROS)
 ```
 
 ## Installation
@@ -82,7 +82,7 @@ or, if none is given, a generated two-keypoint trajectory.
 
 ### Zero-effort control with a TCP safety box
 
-`tests/effort_control_test.py` (live ROS2 only) streams a zero effort command on
+`tests/effort_control_test.py` streams a zero effort command on
 `forward_effort_controller` and keeps the TCP inside an axis-aligned box expressed in the world
 frame:
 
@@ -101,14 +101,22 @@ on Ctrl+C, when `--duration` expires, and on any error while effort control is a
 
 ```bash
 python3 tests/effort_control_test.py --lower -0.5 -0.5 0.2 --upper 0.5 0.5 1.0
+python3 tests/effort_control_test.py --fake --urdf ur10e.urdf --duration 5   # no ROS
 ```
+
+With `--fake` the script uses `FakeCommandBridge`: the TCP pose comes from forward kinematics on
+`--urdf` (URDF root frame = world), controller switches are skipped, and the effort command is only
+stored (the fake robot has no dynamics, so it stays still).
 
 | Argument | Default | Description |
 |---|---|---|
 | `--lower X Y Z` | `-0.8 -0.8 0.1` | Box lower bound in the world frame [m] |
 | `--upper X Y Z` | `0.8 0.8 1.2` | Box upper bound in the world frame [m] |
+| `--fake` | off | Use `FakeCommandBridge` (no ROS) |
+| `--urdf` | none | Robot URDF for the fake TCP pose (required with `--fake`) |
+| `--csv` | none | Skeleton CSV replayed by the fake bridge (synthetic if omitted) |
 | `--tcp-frame` | `ur10e_tool0` | TF frame of the TCP |
-| `--world-frame` | `world` | TF frame the box is expressed in |
+| `--world-frame` | `world` | TF frame the box is expressed in (ignored with `--fake`) |
 | `--rate` | `500` | Control loop rate [Hz] |
 | `--duration` | none | Stop after this many seconds |
 

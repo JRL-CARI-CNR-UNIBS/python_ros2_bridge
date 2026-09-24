@@ -18,6 +18,7 @@ class FakeCommandBridge(BaseCommandBridgeABC):
 
       - _do_publish: stores the last command, sets it as the current joint position
         (ideal tracking), and calls the optional callback
+      - sendEffortCommand: stores the last effort command (no dynamics: the joints do not move)
       - getObstacles(max_age_sec): returns (pos[K,3], vel[K,3], acc[K,3]) at the current simulated time
       - getTcpPose(): forward kinematics of the current joint positions (requires `urdf_path`)
 
@@ -60,6 +61,7 @@ class FakeCommandBridge(BaseCommandBridgeABC):
         self._t0 = time.monotonic() if t0 is None else float(t0)
         self._on_publish = on_publish
         self.last_command: Optional[np.ndarray] = None
+        self.last_effort_command: Optional[np.ndarray] = None
         self.actual_joint_positions_ = np.array([90.0, -140.0, 140.0, -90.0, 90.0, 0.0]) * np.pi / 180.0
         self.last_command = self.actual_joint_positions_.copy()
         self.actual_joint_velocities_ = np.zeros(6, dtype=float)
@@ -90,6 +92,15 @@ class FakeCommandBridge(BaseCommandBridgeABC):
                 self._on_publish(q.copy())
             except Exception:
                 pass
+
+    def sendEffortCommand(self, tau: np.ndarray) -> None:
+        """Store the effort command (no threshold check, no dynamics simulated)."""
+        tau_arr = np.asarray(tau, dtype=float).reshape(-1)
+        if tau_arr.size != len(self.ordered_joint_names_):
+            raise ValueError(
+                f"tau has length {tau_arr.size}, but expected {len(self.ordered_joint_names_)}"
+            )
+        self.last_effort_command = tau_arr.copy()
 
     # --------------------- ABC: obstacles provider ------------------
     def getObstacles(

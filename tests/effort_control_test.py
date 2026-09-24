@@ -2,7 +2,15 @@
 """
 Example script: zero-effort control with a TCP safety box.
 
-Uses JointStateCommandBridge (live ROS2):
+Two modes:
+
+- **ROS2 (default)**: uses JointStateCommandBridge (live robot, TCP pose from TF).
+- **Fake (`--fake`)**: uses FakeCommandBridge. No ROS required; the TCP pose is
+  computed by forward kinematics on `--urdf` (URDF root frame = world). The
+  fake robot has no dynamics, so under zero effort it stays still; controller
+  switches are skipped.
+
+In both modes the script:
 - Waits for the first joint state and the first TCP pose
 - Refuses to start if the TCP is not already inside the box
 - Switches to `forward_effort_controller` and streams a zero effort command
@@ -16,6 +24,7 @@ The switch back to the trajectory controller also happens on Ctrl+C, on
 
 Run:
   python3 effort_control_test.py
+  python3 effort_control_test.py --fake --urdf ur10e.urdf --duration 5
   python3 effort_control_test.py --lower -0.5 -0.5 0.2 --upper 0.5 0.5 1.0
 """
 
@@ -25,9 +34,8 @@ import time
 from typing import List, Optional
 
 import numpy as np
-import rclpy
 
-from python_ros2_bridge.joint_command_bridge import JointStateCommandBridge
+from joint_command_test import make_fake_bridge
 
 
 UR10E_JOINTS: List[str] = [
@@ -44,7 +52,7 @@ def is_inside_box(p: np.ndarray, lower_bound: np.ndarray, upper_bound: np.ndarra
     return bool(np.all(p >= lower_bound) and np.all(p <= upper_bound))
 
 
-def wait_for_tcp_pose(bridge: JointStateCommandBridge, timeout: float = 5.0) -> Optional[np.ndarray]:
+def wait_for_tcp_pose(bridge, timeout: float = 5.0) -> Optional[np.ndarray]:
     """Block until getTcpPose() returns a transform (or timeout)."""
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -61,8 +69,11 @@ def main():
                         metavar=("X", "Y", "Z"), help="box lower bound in world frame [m]")
     parser.add_argument("--upper", type=float, nargs=3, default=[0.8, 0.8, 1.2],
                         metavar=("X", "Y", "Z"), help="box upper bound in world frame [m]")
+    parser.add_argument("--fake", action="store_true", help="use FakeCommandBridge (no ROS)")
+    parser.add_argument("--urdf", default=None, help="robot URDF for the fake bridge TCP pose (required with --fake)")
+    parser.add_argument("--csv", default=None, help="skeleton CSV replayed by the fake bridge")
     parser.add_argument("--tcp-frame", default="ur10e_tool0", help="TF frame of the TCP")
-    parser.add_argument("--world-frame", default="world", help="TF frame the box is expressed in")
+    parser.add_argument("--world-frame", default="world", help="TF frame the box is expressed in (ignored with --fake)")
     parser.add_argument("--rate", type=float, default=500.0, help="control loop rate [Hz]")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     args = parser.parse_args()
@@ -71,15 +82,27 @@ def main():
     upper_bound = np.asarray(args.upper, dtype=float)
     if np.any(lower_bound >= upper_bound):
         parser.error(f"lower bound {lower_bound} must be < upper bound {upper_bound} on every axis")
+    if args.fake and args.urdf is None:
+        parser.error("--fake requires --urdf to compute the TCP pose")
 
-    rclpy.init()
-    bridge = JointStateCommandBridge(
-        ordered_joint_names=UR10E_JOINTS,
-        tcp_frame=args.tcp_frame,
-        world_frame=args.world_frame,
-    )
+    if args.fake:
+        bridge = make_fake_bridge(args.csv, urdf_path=args.urdf, tcp_frame=args.tcp_frame)
+        ok = lambda: True
+    else:
+        import rclpy
+        from python_ros2_bridge.joint_command_bridge import JointStateCommandBridge
+
+        rclpy.init()
+        bridge = JointStateCommandBridge(
+            ordered_joint_names=UR10E_JOINTS,
+            tcp_frame=args.tcp_frame,
+            world_frame=args.world_frame,
+        )
+        ok = rclpy.ok
 
     def shutdown():
+        if args.fake:
+            return
         bridge.shutdown()
         try:
             rclpy.shutdown()
@@ -109,12 +132,13 @@ def main():
     # Send a zero command before switching so the effort controller does not
     # start from a stale command.
     bridge.sendEffortCommand(tau)
-    bridge.switch_to_forward_effort_controller_service()
+    if not args.fake:
+        bridge.switch_to_forward_effort_controller_service()
     print(f"Zero-effort control active, box: lower={lower_bound}, upper={upper_bound}")
 
     t_start = time.time()
     try:
-        while rclpy.ok():
+        while ok():
             if args.duration is not None and time.time() - t_start > args.duration:
                 print("Duration elapsed.")
                 break
@@ -135,7 +159,8 @@ def main():
         pass
     finally:
         try:
-            bridge.switch_to_trajectory_controller_service()
+            if not args.fake:
+                bridge.switch_to_trajectory_controller_service()
         finally:
             shutdown()
 

@@ -62,7 +62,7 @@ def write_synthetic_skeleton_csv(path: str, duration: float = 10.0, dt: float = 
     np.savetxt(path, data, delimiter=",", header=header, comments="")
 
 
-def make_fake_bridge(csv_path: Optional[str]):
+def make_fake_bridge(csv_path: Optional[str], **kwargs):
     from python_ros2_bridge.fake_command_bridge import FakeCommandBridge
 
     if csv_path is None:
@@ -76,6 +76,7 @@ def make_fake_bridge(csv_path: Optional[str]):
         threshold=1.0,
         csv_path=csv_path,
         auto_diff_if_missing=True,  # synthetic CSV has positions only
+        **kwargs,
     )
 
 
