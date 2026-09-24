@@ -48,6 +48,12 @@ class BaseCommandBridgeABC(ABC):
         """
         ...
 
+    def getTcpPose(self) -> Optional[np.ndarray]:
+        """Return the TCP pose in the world frame as a 4x4 homogeneous matrix (world_T_tcp).
+        Not abstract so existing subclasses keep working; override where supported.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not provide a TCP pose")
+
     # -------------------------- Public API --------------------------
     def sendCommand(self, q: np.ndarray) -> None:
         """Threshold-checked command dispatch.

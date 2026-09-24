@@ -47,6 +47,8 @@ class JointStateCommandBridge(Node, BaseCommandBridgeABC):
         position_controller_name: str = "forward_position_controller",
         trajectory_controller_name: str = "scaled_joint_trajectory_controller",
         effort_controller_name: str = "forward_effort_controller",
+        tcp_frame: str = "tool0",
+        world_frame: str = "world",
         timeout_sec: float = 5.0,
         start_executor: bool = True,
     ) -> None:
@@ -89,6 +91,8 @@ class JointStateCommandBridge(Node, BaseCommandBridgeABC):
         self._svc_timeout_sec = float(timeout_sec)
 
         # TF + caches
+        self.tcp_frame = str(tcp_frame)
+        self.world_frame = str(world_frame)
         self._tf_buffer: Buffer = Buffer()
         self._tf_listener: TransformListener = TransformListener(self._tf_buffer, self)
         self._frame_to_world_cache: Dict[str, np.ndarray] = {}
@@ -324,6 +328,15 @@ class JointStateCommandBridge(Node, BaseCommandBridgeABC):
         msg.data = tau_arr.tolist()
         self._effort_cmd_pub.publish(msg)
 
+    # ---------------------------- TCP pose ----------------------------
+    def getTcpPose(self) -> Optional[np.ndarray]:
+        """Latest TCP pose in the world frame as a 4x4 homogeneous matrix (world_T_tcp).
+
+        Looked up from TF (`world_frame` -> `tcp_frame`) on every call, never cached.
+        Returns None if the transform is not available yet.
+        """
+        return self._lookup_transform_matrix(self.world_frame, self.tcp_frame, rclpy.time.Time())
+
     # ---------------------------- TF + utilities (ROS-specific) ----------------------------
     def _get_transform_matrix_to_world(self, frame_id: str, stamp) -> Optional[np.ndarray]:
         if frame_id in self._frame_to_world_cache:
@@ -334,23 +347,29 @@ class JointStateCommandBridge(Node, BaseCommandBridgeABC):
             )
         except Exception:
             time_obj = rclpy.time.Time()
+        T = self._lookup_transform_matrix("world", frame_id, time_obj)
+        if T is not None:
+            self._frame_to_world_cache[frame_id] = T
+        return T
+
+    def _lookup_transform_matrix(self, target_frame: str, source_frame: str, time_obj) -> Optional[np.ndarray]:
+        """TF lookup as a 4x4 matrix (target_T_source); None, with a throttled warning, on failure."""
         try:
-            ts = self._tf_buffer.lookup_transform("world", frame_id, time_obj)
+            ts = self._tf_buffer.lookup_transform(target_frame, source_frame, time_obj)
         except Exception as e:
-            last = self._last_tf_warn_time.get(frame_id, 0.0)
+            key = f"{target_frame}->{source_frame}"
+            last = self._last_tf_warn_time.get(key, 0.0)
             now = time.monotonic()
             if now - last > 2.0:
-                self.get_logger().warn(f"TF to world unavailable for '{frame_id}': {e}")
-                self._last_tf_warn_time[frame_id] = now
+                self.get_logger().warn(f"TF '{key}' unavailable: {e}")
+                self._last_tf_warn_time[key] = now
             return None
 
         t = ts.transform.translation
         q = ts.transform.rotation
         T = np.eye(4, dtype=float)
-        R = self._quat_to_rot(q.x, q.y, q.z, q.w)
-        T[:3, :3] = R
+        T[:3, :3] = self._quat_to_rot(q.x, q.y, q.z, q.w)
         T[:3, 3] = np.array([t.x, t.y, t.z], dtype=float)
-        self._frame_to_world_cache[frame_id] = T
         return T
 
     @staticmethod
@@ -378,6 +397,10 @@ class JointStateCommandBridge(Node, BaseCommandBridgeABC):
                 self._executor.shutdown()
             except Exception:
                 pass
+            # Wait for spin() to return before tearing down the node
+            if self._spin_thread is not None:
+                self._spin_thread.join(timeout=2.0)
+                self._spin_thread = None
             try:
                 self._executor.remove_node(self)
             except Exception:
@@ -445,3 +468,12 @@ class JointStateCommandBridge(Node, BaseCommandBridgeABC):
             timeout_sec=timeout_sec,
         )
         self.get_logger().info("Controller switch to forward effort controller completed successfully.")
+
+    def switch_to_trajectory_controller_service(self, timeout_sec: float = 10.0) -> None:
+        """Stop the forward position/effort controllers and start the trajectory controller."""
+        self._switch_controllers(
+            start_controllers=[self._traj_ctrl],
+            stop_controllers=[self._pos_ctrl, self._effort_ctrl],
+            timeout_sec=timeout_sec,
+        )
+        self.get_logger().info("Controller switch to trajectory controller completed successfully.")

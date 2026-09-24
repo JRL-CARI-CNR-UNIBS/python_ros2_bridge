@@ -16,8 +16,11 @@ class FakeCommandBridge(BaseCommandBridgeABC):
     Topic-free, ROS-free bridge that simulates human poses from a CSV using PoseReader.
     Implements the BaseCommandBridgeABC interface:
 
-      - _do_publish: stores the last command (and optional callback)
+      - _do_publish: stores the last command, sets it as the current joint position
+        (ideal tracking), and calls the optional callback
+      - sendEffortCommand: stores the last effort command (no dynamics: the joints do not move)
       - getObstacles(max_age_sec): returns (pos[K,3], vel[K,3], acc[K,3]) at the current simulated time
+      - getTcpPose(): forward kinematics of the current joint positions (requires `urdf_path`)
 
     Time evolution:
       - Let T = human_trj_time.
@@ -39,6 +42,8 @@ class FakeCommandBridge(BaseCommandBridgeABC):
         on_publish: Optional[Callable[[np.ndarray], None]] = None,
         auto_diff_if_missing: bool = False,
         t0: Optional[float] = None,
+        urdf_path: Optional[str] = None,
+        tcp_frame: str = "tool0",
     ) -> None:
         super().__init__(ordered_joint_names, threshold=threshold)
 
@@ -56,19 +61,46 @@ class FakeCommandBridge(BaseCommandBridgeABC):
         self._t0 = time.monotonic() if t0 is None else float(t0)
         self._on_publish = on_publish
         self.last_command: Optional[np.ndarray] = None
+        self.last_effort_command: Optional[np.ndarray] = None
         self.actual_joint_positions_ = np.array([90.0, -140.0, 140.0, -90.0, 90.0, 0.0]) * np.pi / 180.0
         self.last_command = self.actual_joint_positions_.copy()
         self.actual_joint_velocities_ = np.zeros(6, dtype=float)
         self.actual_joint_accelerations_ = np.zeros(6, dtype=float)
 
+        # --- Optional kinematic model for getTcpPose (URDF root frame = world) ---
+        self._pin_model: Optional[pin.Model] = None
+        if urdf_path is not None:
+            self._pin_model = pin.buildModelFromUrdf(urdf_path)
+            self._pin_data = self._pin_model.createData()
+            if not self._pin_model.existFrame(tcp_frame):
+                raise ValueError(f"TCP frame '{tcp_frame}' not found in {urdf_path}")
+            self._tcp_frame_id = self._pin_model.getFrameId(tcp_frame)
+            self._q_idx = []
+            for name in self.ordered_joint_names_:
+                if not self._pin_model.existJointName(name):
+                    raise ValueError(f"Joint '{name}' not found in {urdf_path}")
+                self._q_idx.append(self._pin_model.joints[self._pin_model.getJointId(name)].idx_q)
+
     # --------------------- ABC: command publish ---------------------
     def _do_publish(self, q: np.ndarray) -> None:
         self.last_command = q.copy()
+        # Ideal tracking: the simulated robot reaches the commanded position instantly
+        with self._state_lock:
+            self.actual_joint_positions_[:] = q
         if self._on_publish is not None:
             try:
                 self._on_publish(q.copy())
             except Exception:
                 pass
+
+    def sendEffortCommand(self, tau: np.ndarray) -> None:
+        """Store the effort command (no threshold check, no dynamics simulated)."""
+        tau_arr = np.asarray(tau, dtype=float).reshape(-1)
+        if tau_arr.size != len(self.ordered_joint_names_):
+            raise ValueError(
+                f"tau has length {tau_arr.size}, but expected {len(self.ordered_joint_names_)}"
+            )
+        self.last_effort_command = tau_arr.copy()
 
     # --------------------- ABC: obstacles provider ------------------
     def getObstacles(
@@ -107,6 +139,17 @@ class FakeCommandBridge(BaseCommandBridgeABC):
         vel = np.asarray(vel_list, dtype=float).reshape(-1, 3)
         acc = np.asarray(acc_list, dtype=float).reshape(-1, 3)
         return pos, vel, acc
+
+    # --------------------- TCP pose (forward kinematics) ---------------------
+    def getTcpPose(self) -> np.ndarray:
+        """TCP pose in the world (URDF root) frame as a 4x4 homogeneous matrix (world_T_tcp)."""
+        if self._pin_model is None:
+            raise RuntimeError("getTcpPose requires FakeCommandBridge(urdf_path=...)")
+        q = pin.neutral(self._pin_model)
+        q[self._q_idx] = self.getPositions()
+        pin.framesForwardKinematics(self._pin_model, self._pin_data, q)
+        return self._pin_data.oMf[self._tcp_frame_id].homogeneous.copy()
+
     # ---------------------------- Getters ----------------------------
     def getPositions(self) -> np.ndarray:
         with self._state_lock:

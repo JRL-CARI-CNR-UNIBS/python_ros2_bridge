@@ -16,6 +16,10 @@ dependencies = [
     "numpy",
     "pandas",
     "pin",
+    # Not imported directly, but required by rclpy when running inside a
+    # pip/conda environment on top of a sourced ROS2 installation.
+    "pyyaml",
+    "typing_extensions",
 ]
 
 [tool.setuptools.packages.find]
